@@ -1,0 +1,971 @@
+---
+title: "Projekt z Automatycznej Analizy Obrazów - ziarna kawy"
+author: "Maksym Volchanskyi"
+date: "2024-06-17"
+output:
+  html_document:
+    css: styles.css    
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, message=FALSE, echo=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r Biblioteki, message=FALSE, warning=FALSE, include=FALSE}
+#Libs
+library(tidyverse)
+library(keras3, quietly = T)
+library(tensorflow, quietly = T)
+library(ggplot2)
+library(gridExtra)
+library(tictoc)
+library(knitr)
+library(tfdatasets)
+library(caret)
+library(pROC)
+```
+
+```{r Funkcje, warning=FALSE, message=FALSE}
+#Functions
+#________________________________________________________________
+# Funkcja do trenowania i ewaluacji modelu
+
+train_and_evaluate <- function(model, train_ds, val_ds, epochs = 20, history_var_name = "history") {
+  tic("Training Time")
+  history <- model %>% fit(
+    train_ds,
+    epochs = epochs,
+    validation_data = val_ds
+  )
+  training_time <- toc()
+  
+  # Save history to a variable with the specified name
+  assign(history_var_name, history, envir = .GlobalEnv)
+  
+  # Extract accuracy and loss
+  final_accuracy <- history$metrics$val_accuracy[epochs]
+  final_loss <- history$metrics$val_loss[epochs]
+  
+  list(
+    accuracy = final_accuracy,
+    loss = final_loss,
+    training_time = training_time$toc - training_time$tic
+  )
+}
+#________________________________________________________________
+#Wyświetlenie
+
+display_image_tensor <- function(x, ..., max = 255, plot_margins = c(0, 0, 0, 0)) {
+  if (!is.null(plot_margins))
+    par(mar = plot_margins)
+
+  x %>%
+    as.array() %>%
+    drop() %>%
+    as.raster(max = max) %>%
+    plot(..., interpolate = FALSE)
+}
+#________________________________________________________________
+# Pobieranie metryk podczas ewaluacji modelu na zbiorze testowym
+
+evaluate_model <- function(model, testing_ds) {
+  tic("Evaluation time")
+  
+  evaluation <- model %>% evaluate(testing_ds)
+  preds <- model %>% predict(testing_ds)
+  
+  time_taken <- toc()
+  
+  accuracy <- evaluation$accuracy
+  loss <- evaluation$loss
+  
+  return(list(
+    accuracy = accuracy,
+    loss = loss,
+    time_taken = time_taken$toc - time_taken$tic,
+    preds = preds
+  ))
+}
+
+#________________________________________________________________
+# Confusion Matrix
+
+calculate_confusion_matrix <- function(model, test_ds) {
+  # Initialize vectors for predictions and true labels
+  predictions <- c()
+  true_labels <- c()
+  
+  # Iterate through the dataset batches
+  test_batches <- as_iterator(test_ds)
+  
+  while (TRUE) {
+    batch <- iter_next(test_batches)
+    if (is.null(batch)) break
+    
+    images <- batch[[1]]
+    labels <- batch[[2]]
+    
+    # Get model predictions
+    preds <- model %>% predict(images)
+    predicted_labels <- apply(preds, 1, which.max) - 1
+    true_labels <- c(true_labels, apply(as.array(labels), 1, which.max) - 1)
+    predictions <- c(predictions, predicted_labels)
+  }
+  
+  # Calculate confusion matrix
+  confusion_matrix <- confusionMatrix(factor(predictions), factor(true_labels))
+  return(confusion_matrix)
+}
+
+#________________________________________________________________
+# Function to evaluate predictions
+evaluate_predictions <- function(model, dataset) {
+  batch <- dataset %>%
+    as_iterator() %>%
+    iter_next()
+  
+  c(images, labels) %<-% batch
+  preds <- model %>% predict(images)
+  predicted_labels <- apply(preds, 1, which.max) - 1
+  true_labels <- apply(as.array(labels), 1, which.max) - 1
+  
+  list(images = images, true_labels = true_labels, predicted_labels = predicted_labels)
+}
+#________________________________________________________________
+# Function to visualize predictions
+visualize_predictions <- function(evaluation_results, categories, n = 9) {
+  par(mfrow = c(3, 3), mar = c(3, 3, 3, 3))
+  
+  for (i in sample(1:length(evaluation_results$true_labels), n)) {
+    display_image_tensor(evaluation_results$images[i,,,], plot_margins = c(2.5, 2.5, 2.5, 2.5))
+    title(paste("True:", categories[evaluation_results$true_labels[i] + 1], 
+                "\nPred:", categories[evaluation_results$predicted_labels[i] + 1]))
+  }
+}
+
+```
+
+## **Wprowadzenie**
+
+Projekt skupia się na wykorzystaniu kompleksowego zbioru danych zawierającego obrazy różnych typów ziaren kawy. Każdy obraz został przeskalowany do rozmiaru 224x224 pikseli, co zapewnia jednolite przetwarzanie i optymalne wykorzystanie zasobów obliczeniowych. Zbiór danych obejmuje różnorodne warianty ziaren, co umożliwia dokładne rozpoznawanie i klasyfikację.
+
+### **Cel projektu**
+
+Głównym celem projektu jest rozwój zaawansowanych algorytmów analizy obrazów, które mogą być stosowane w takich dziedzinach jak kontrola jakości w rolnictwie, ocena ziaren kawy oraz zautomatyzowane systemy sortowania. Dzięki bogatej różnorodności obrazów, zbiór danych pozwala na skuteczne trenowanie modeli uczenia maszynowego, co przyczynia się do poprawy dokładności i efektywności analizy.
+
+### Przygotowanie zbiorów danych do analizy
+
+W projekcie analizującym obrazy ziaren kawy, pierwszym krokiem jest zdefiniowanie głównych ścieżek do danych treningowych i testowych. Ścieżka bazowa prowadzi do katalogu projektu, gdzie znajdują się foldery z odpowiednimi zestawami danych.
+
+Następnie, z katalogu treningowego, wyodrębniane są klasy ziaren kawy. Dzięki tej metodzie można automatycznie zidentyfikować różne rodzaje ziaren, co jest kluczowe dla dalszej analizy i klasyfikacji w ramach projektu.
+
+```{r Ścieżki dostępu i klasy}
+#Ładowanie ścieżek 
+base_dir <- "C:/Users/3adro/Desktop/3k2s/Automatyczna analiza obrazu/Project/CoffeeBeans"
+train_dir <- file.path(base_dir, "train")
+test_dir <- file.path(base_dir, "test")
+
+#Wyciąganie klasów ziarna 
+classes <- list.dirs(train_dir, recursive = F, full.names = F)
+
+results <- list()
+```
+
+Dane zostały podzielone na zbiory treningowe, walidacyjne i testowe, z obrazami w formacie RGB przeskalowanymi do 128x128 pikseli. Rozmiar partii wynosi 64, co optymalizuje przetwarzanie. Zestaw treningowy zawiera losowo mieszane dane z 5% przeznaczonymi na walidację, co pomaga monitorować i unikać przeuczenia modelu. Zbiór testowy jest używany do końcowej oceny modelu na niezmieszanych danych.
+
+```{r Zbiory Danych, message=FALSE, warning=FALSE, results='hide'}
+batch_size <- 64
+image_size <- c(128, 128)
+channels <- 3
+
+train_ds <- image_dataset_from_directory(
+  train_dir,
+  labels = "inferred",
+  label_mode = "categorical",
+  shuffle = TRUE,
+  validation_split = 0.05,
+  subset = "training",
+  image_size = image_size,
+  batch_size = batch_size,
+  seed = 2024
+)
+
+val_ds <- image_dataset_from_directory(
+  train_dir,
+  labels = "inferred",
+  label_mode = "categorical",
+  shuffle = TRUE,
+  validation_split = 0.05,
+  subset = "validation",
+  image_size = image_size,
+  batch_size = batch_size,
+  seed = 2024
+)
+
+test_ds <- image_dataset_from_directory(
+  test_dir,
+  labels = "inferred",
+  label_mode = "categorical",
+  shuffle = FALSE,
+  image_size = image_size,
+  batch_size = batch_size
+)
+```
+
+```{r Wizualizacja ziaren, message=TRUE, echo=TRUE}
+
+batch <- train_ds %>%
+  as_iterator() %>%
+  iter_next()
+
+c(images, labels) %<-% batch
+
+par(mfrow = c(3, 3))
+for (i in 1:9) {
+  display_image_tensor(images[i,,,], plot_margins = rep(0.5, 4))
+}
+```
+
+## Modele
+
+### Konwolucyjna sieć neuronowa - model 1
+
+Model sekwencyjny jest zdefiniowany jako konwolucyjna sieć neuronowa do analizy obrazów. Model ten ma na celu efektywną ekstrakcję cech i klasyfikację danych obrazowych. Struktura modelu opiera się na kilku warstwach konwolucyjnych, które stopniowo zwiększają liczbę filtrów, umożliwiając uchwycenie złożonych wzorców i tekstur. Proces redukcji wymiarów przy użyciu warstw Max Pooling pomaga w zmniejszeniu ilości parametrów, co prowadzi do mniejszego ryzyka przeuczenia. Na końcu, zastosowanie warstw gęstych oraz funkcji softmax pozwala na dokładne przewidywanie klasy obrazu. Poniżej znajduje się szczegółowy opis poszczególnych warstw:
+
+1.  **Warstwa konwolucyjna**: Zawiera 32 filtry o rozmiarze 3x3, wykorzystując funkcję aktywacji ReLU.
+
+2.  **Warstwa Max Pooling**: Redukuje wymiary danych wejściowych przy użyciu okna o rozmiarze 2x2.
+
+3.  **Druga warstwa konwolucyjna**: Składa się z 64 filtrów o rozmiarze 3x3, z aktywacją ReLU.
+
+4.  **Druga warstwa Max Pooling**: Ponownie stosuje pooling o rozmiarze 2x2.
+
+5.  **Trzecia warstwa konwolucyjna**: Zawiera 128 filtrów o rozmiarze 3x3, z aktywacją ReLU.
+
+6.  **Trzecia warstwa Max Pooling**: Pooling o rozmiarze 2x2.
+
+7.  **Czwarta warstwa konwolucyjna**: Składa się z 512 filtrów o rozmiarze 3x3, z aktywacją ReLU.
+
+8.  **Czwarta warstwa Max Pooling**: Pooling o rozmiarze 2x2.
+
+9.  **Warstwa spłaszczająca**: Przekształca dane z poprzednich warstw na jednowymiarowy wektor.
+
+10. **Warstwa gęsta**: Zawiera 128 neuronów z funkcją aktywacji ReLU.
+
+11. **Warstwa Dropout**: Stosuje dropout z prawdopodobieństwem 0.5, aby zredukować przeuczenie.
+
+12. **Warstwa wyjściowa**: Zawiera 4 neurony z aktywacją softmax, przeznaczone do klasyfikacji na cztery kategorie.
+
+```{r Model-1-Strkutura}
+# Model
+model1 <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 32, kernel_size = 3, activation = 'relu', input_shape = c(image_size, channels)) %>%
+  layer_max_pooling_2d(pool_size = 2) %>%
+  layer_conv_2d(filters = 64, kernel_size = 3, activation = 'relu') %>%
+  layer_max_pooling_2d(pool_size = 2) %>%
+  layer_conv_2d(filters = 128, kernel_size = 3, activation = 'relu') %>%
+  layer_max_pooling_2d(pool_size = 2) %>%
+  layer_conv_2d(filters = 512, kernel_size = 3, activation = 'relu') %>%
+  layer_max_pooling_2d(pool_size = 2) %>%
+  layer_flatten() %>%
+  layer_dense(units = 128, activation = 'relu') %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_dense(units = 4, activation = 'softmax')
+```
+
+Model `model1` został skompilowany z wykorzystaniem funkcji straty `categorical_crossentropy`, optymalizatora `Adam` z określoną szybkością uczenia oraz metryki `accuracy` do oceny dokładności.
+
+```{r Kompilacja-Modelu-1 }
+# Kompilacja modelu
+model1 %>% compile(
+  loss = 'categorical_crossentropy',
+  optimizer = optimizer_adam(learning_rate = 1e-4),
+  metrics = list("accuracy")
+)
+```
+
+Funkcja `train_and_evaluate` trenuje model `model1` na zestawach danych `train_ds` i `val_ds` przez określoną liczbę epok. W trakcie treningu rejestrowany jest czas jego trwania. Historia uczenia jest zapisywana w zmiennej o nazwie `history1`, a następnie z funkcji zwracane są końcowe wartości dokładności i straty walidacyjnej, co pozwala na ocenę wydajności modelu.
+
+```{r Uczenie-oraz-Metryki-do-Pierwszego Modelu, message=TRUE, results='hide'}
+Model1Metrics_Train <- train_and_evaluate(model1, train_ds, val_ds, 20, "history1")
+```
+
+```{r Wykres-Procesu-Uczneia}
+plot(history1)
+```
+
+Wykres przedstawia wyniki trenowania modelu, podzielone na dwie części: dokładność i stratę w zależności od liczby epok.
+
+1.  **Dokładność**:
+
+    -   **Linia treningowa (czerwona)**: Systematyczny wzrost dokładności, stabilizujący się po około 10 epokach.
+
+    -   **Linia walidacyjna (turkusowa)**: Szybszy wzrost dokładności, osiągająca wysoką wartość, co sugeruje dobrą generalizację modelu na danych walidacyjnych.
+
+2.  **Strata**:
+
+    -   **Linia treningowa (czerwona)**: Znaczny spadek straty w początkowych epokach, stabilizujący się po kilku epokach.
+
+    -   **Linia walidacyjna (turkusowa)**: Podobny spadek straty, zbliżający się do niskiej wartości, co również wskazuje na efektywne uczenie modelu.
+
+Ogólnie, model wykazuje dobrą wydajność, z wysoką dokładnością i niską stratą zarówno na zbiorze treningowym, jak i walidacyjnym, co sugeruje brak przeuczenia.
+
+#### Wizualizacji predykcij
+
+```{r results='hide'}
+ev_r <- evaluate_predictions(model1, train_ds)
+```
+
+```{r}
+visualize_predictions(ev_r, classes)
+```
+
+#### Ewaluacja na zbiorze testowym
+
+```{r Ewaluacja-Na-Zbiorze-Testowym, message=FALSE, warning=FALSE, results='hide'}
+Model1Metrics_Test<-evaluate_model(model1, test_ds)
+conf_m <- calculate_confusion_matrix(model1, test_ds)
+```
+
+```{r Macierz-Błędu, message=TRUE}
+print(conf_m$table)
+```
+
+-   **Dokładność**: Wysoka, ponieważ większość predykcji jest zgodna z rzeczywistymi klasami.
+
+-   **Błędy**: Drobne błędy w klasie 0 i 3 (po jednym błędnym przypisaniu), co wskazuje na sporadyczne pomyłki.
+
+### Konwolucyjna sieć neuronowa - model 2
+
+Drugi model konwolucyjny został zaprojektowany z myślą o lepszym wydobywaniu cech i stabilizacji procesu uczenia. Wykorzystuje zwiększoną liczbę filtrów, co pozwala na dokładniejsze wychwytywanie złożonych wzorców w danych obrazowych. Każda warstwa konwolucyjna jest wspierana przez normalizację wsadową, co stabilizuje i przyspiesza proces trenowania, poprawiając jednocześnie generalizację modelu. Po złożonym przetwarzaniu obrazu model przechodzi do warstwy gęstej z 256 jednostkami, gdzie zachodzą kluczowe procesy klasyfikacji, wspierane przez warstwę dropout w celu redukcji przeuczenia. Ostateczna warstwa softmax z czterema jednostkami umożliwia precyzyjną klasyfikację danych do jednej z czterech klas. Model ten stanowi ulepszoną wersję, która ma na celu osiągnięcie wyższej dokładności i skuteczności analizy obrazów.
+
+W porównaniu obu modeli widać kilka istotnych różnic:
+
+1.  **Rozmiary filtrów**: W drugim modelu zwiększono liczbę filtrów w początkowych warstwach, zaczynając od 64, a kończąc na 512, podczas gdy w pierwszym modelu zakres wynosi od 32 do 512. Zwiększenie liczby filtrów pozwala na dokładniejsze wychwytywanie cech obrazu już na wczesnych etapach.
+
+2.  **Normalizacja wsadowa (Batch Normalization)**: Drugi model wprowadza warstwy normalizacji wsadowej po każdej warstwie konwolucyjnej, co pomaga w stabilizacji i przyspieszeniu procesu trenowania, redukując problem zmiany rozkładu aktywacji w każdej warstwie.
+
+3.  **Warstwa gęsta**: W drugim modelu zastosowano 256 jednostek w warstwie gęstej, w porównaniu do 128 jednostek w pierwszym modelu. Większa liczba jednostek umożliwia bardziej złożone uczenie się cech i lepszą reprezentację danych.
+
+4.  **Złożoność modelu**: Drugi model, dzięki dodatkowym filtrom i warstwom normalizacji wsadowej, jest bardziej złożony i ma większą pojemność modelu, co może prowadzić do lepszej ogólnej wydajności na bardziej złożonych zbiorach danych.
+
+5.  **Złożoność modelu**: Model `model2` ma większą liczbę filtrów i dodatkowe warstwy normalizacji wsadowej, co zwiększa złożoność i liczbę parametrów. Może to prowadzić do dłuższego czasu trenowania oraz większego ryzyka przeuczenia, zwłaszcza na mniejszych zbiorach danych.
+
+```{r Model-2-Strkutura}
+# Model
+model2 <- keras_model_sequential() %>%
+  layer_conv_2d(filters = 64, kernel_size = 3, activation = 'relu', input_shape = c(image_size, channels)) %>%
+  layer_batch_normalization() %>%
+  layer_max_pooling_2d(pool_size = 2) %>%
+  layer_conv_2d(filters = 128, kernel_size = 3, activation = 'relu') %>%
+  layer_batch_normalization() %>%
+  layer_max_pooling_2d(pool_size = 2) %>%
+  layer_conv_2d(filters = 256, kernel_size = 3, activation = 'relu') %>%
+  layer_batch_normalization() %>%
+  layer_max_pooling_2d(pool_size = 2) %>%
+  layer_conv_2d(filters = 512, kernel_size = 3, activation = 'relu') %>%
+  layer_batch_normalization() %>%
+  layer_max_pooling_2d(pool_size = 2) %>%
+  layer_flatten() %>%
+  layer_dense(units = 256, activation = 'relu') %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_dense(units = 4, activation = 'softmax')
+
+```
+
+```{r Kompilacja-Modelu-2}
+model2 %>% compile(
+  optimizer = optimizer_adam(learning_rate = 1e-4),
+  loss = 'categorical_crossentropy',
+  metrics = c('accuracy')
+)
+```
+
+```{r Uczenie-oraz-Metryki-do-Drugiego-Modelu, results='hide'}
+Model2Metrics_Train <- train_and_evaluate(model2, train_ds, val_ds, 20, "history2")
+```
+
+```{r Wykres-Procesu-Uczenia}
+plot(history2)
+```
+
+1.  **Dokładność**:
+
+    -   **Linia treningowa (czerwona)**: Wysoka dokładność, szybko stabilizująca się na poziomie bliskim 1.0.
+
+    -   **Linia walidacyjna (turkusowa)**: Również wysoka dokładność, ale osiągana stopniowo w miarę zwiększania liczby epok.
+
+2.  **Strata**:
+
+    -   **Linia treningowa (czerwona)**: Niska strata, szybko stabilizująca się na niskim poziomie.
+
+    -   **Linia walidacyjna (turkusowa)**: Strata gwałtownie spada w pierwszych kilku epokach, następnie stabilizuje się na niskim poziomie.
+
+#### Porównanie z poprzednim modelem
+
+-   **Dokładność**: Oba wykresy pokazują podobne wzorce, z linią walidacyjną stopniowo zbliżającą się do linii treningowej, sugerując dobrą generalizację.
+
+-   **Strata**: W obu przypadkach strata treningowa i walidacyjna szybko maleje i stabilizuje się, co wskazuje na efektywne uczenie się modelu bez widocznego przeuczenia.
+
+Ogólnie, oba modele wykazują dobre wyniki z wysoką dokładnością i niską stratą. Różnice mogą być subtelne i zależne od szczegółowych parametrów modelu oraz zestawów danych.
+
+#### Wizualizacja predykcji
+
+```{r results='hide'}
+ev_r <- evaluate_predictions(model2, train_ds)
+```
+
+```{r}
+visualize_predictions(ev_r, classes)
+```
+
+#### Ewaluacja na zbiorze testowym
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+Model2Metrics_Test <- evaluate_model(model2, test_ds)
+conf_m <- calculate_confusion_matrix(model2, test_ds)
+```
+
+```{r warning=FALSE,  message=TRUE}
+print(conf_m$table)
+```
+
+-   **Dokładność**: Idealna, bez błędnych klasyfikacji. Wszystkie przypadki są prawidłowo przypisane do odpowiednich klas.
+
+-   **Błędy**: Brak błędów, co sugeruje doskonałe dopasowanie modelu do danych.
+
+#### Porównanie względem metryk
+
+```{r}
+# Kombinowanie metryk 1 i 2 modelu
+results_df <- data.frame(
+  Model = c("Model 1", "Model 2"),
+  accuracy = c(Model1Metrics_Test$accuracy, Model2Metrics_Test$accuracy),
+  loss = c(Model1Metrics_Test$loss, Model2Metrics_Test$loss),
+  time_taken = c(Model1Metrics_Test$time_taken, Model2Metrics_Test$time_taken)
+)
+
+kable(results_df)
+
+# Wizualizacja
+results_df_long <- results_df %>%
+  pivot_longer(cols = c("accuracy", "loss", "time_taken"), names_to = "Metric", values_to = "Value")
+
+ggplot(results_df_long, aes(x = Model, y = Value, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~Metric, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Metryki na Zbiorze Testowym", y = "Value", x = "Model")
+
+```
+
+1.  **Dokładność**:
+
+    -   Oba modele, `Model 1` i `Model 2`, osiągają bardzo podobną wysoką dokładność, co sugeruje, że oba są skuteczne w klasyfikacji danych testowych.
+
+2.  **Strata**:
+
+    -   `Model 2` wykazuje znacznie niższą stratę w porównaniu do `Model 1`, co wskazuje na lepsze dopasowanie modelu do danych testowych.
+
+3.  **Czas trenowania**:
+
+    -   `Model 2` wymaga znacznie więcej czasu na trening niż `Model 1`. Może to być wynikiem większej złożoności modelu `Model 2`, co wpływa na wydłużenie czasu przetwarzania.
+
+### Wnioski
+
+-   **Wydajność**: `Model 2` osiąga niższą stratę przy podobnej dokładności, co sugeruje lepsze dopasowanie i potencjalnie lepszą generalizację.
+
+-   **Koszt obliczeniowy**: `Model 2` jest bardziej wymagający obliczeniowo, co może być istotnym czynnikiem przy wyborze modelu, zwłaszcza w kontekście dostępnych zasobów.
+
+## Transfer learning
+
+Transfer learning to technika w uczeniu maszynowym, która polega na wykorzystaniu wiedzy zdobytej podczas rozwiązywania jednego problemu do innego, powiązanego zadania. W kontekście analizy obrazów, transfer learning pozwala na zastosowanie wcześniej wytrenowanych modeli, co przyspiesza proces uczenia i zwiększa jego efektywność. Dzięki temu podejściu można osiągnąć wysoką dokładność klasyfikacji nawet przy ograniczonej ilości danych treningowych. W projekcie zastosowano transfer learning do poprawy jakości analizy ziaren kawy, co pozwala na skuteczne wykorzystanie istniejących wzorców i przyspieszenie procesu rozwoju modelu.
+
+### Resnet50
+
+ResNet50 to zaawansowana architektura sieci neuronowej, która składa się z 50 warstw. Wyróżnia się zastosowaniem bloków rezydualnych, co pozwala na skuteczne trenowanie bardzo głębokich sieci. Model zaczyna się od warstwy wejściowej z zerowym wypełnieniem (zero padding), po której następuje warstwa konwolucyjna (CONV) z normalizacją wsadową (Batch Norm) i funkcją aktywacji ReLU, a także maksymalnym poolingiem (Max Pool).
+
+Kolejne etapy składają się z bloków konwolucyjnych i bloków tożsamościowych (ID Block), co umożliwia zachowanie informacji poprzez dodanie rezydualne. Ostateczna warstwa globalnego pooling (Avg Pool), spłaszczenia i warstwa w pełni połączona (FC) prowadzą do wyjścia modelu, które służy do klasyfikacji. Dzięki tej konstrukcji ResNet50 osiąga wysoką dokładność w rozpoznawaniu obrazów przy jednoczesnym ograniczeniu problemu znikających gradientów.
+
+![](images/ResNet50.jpg)
+
+Proces implementacji i dostosowania modelu składa się z kilku kluczowych kroków:
+
+1.  **Wczytanie modelu ResNet50**: Model jest wczytywany bez ostatnich warstw, co pozwala na dostosowanie go do specyficznych danych wejściowych o zadanych wymiarach.
+
+2.  **Zamrożenie warstw**: Wszystkie warstwy modelu są początkowo zablokowane, co chroni wyuczone wcześniej cechy, zapobiegając ich zmianie podczas dalszego trenowania.
+
+3.  **Odmrożenie warstw do tuningu**: Wybrane warstwy są odblokowywane od konkretnej warstwy (`conv5_block1_out`), co umożliwia precyzyjne dostosowanie modelu do nowych danych poprzez fine-tuning.
+
+4.  **Budowa modelu `model3`**: Do wstępnie wytrenowanego modelu dodaje się warstwę globalnego uśredniania, warstwę gęstą z 1024 jednostkami i warstwę dropout, co wzbogaca model o dodatkowe możliwości klasyfikacyjne, zakończone warstwą wyjściową dla czterech kategorii.
+
+5.  **Kompilacja modelu**: Proces ten wykorzystuje optymalizator `Adam` z określoną szybkością uczenia i funkcję straty `categorical_crossentropy`, co jest standardem w zadaniach klasyfikacji wieloklasowej.
+
+6.  **Trenowanie modelu**: Model `model3` jest trenowany na zestawach danych treningowych i walidacyjnych przez 20 epok, a historia treningu jest zapisywana w zmiennej `history3`, co pozwala na śledzenie postępów uczenia i oceny wydajności modelu.
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, results='hide'}
+# ResNet50
+pre_trained_model <- application_resnet50(
+  weights = 'imagenet',
+  input_shape = c(image_size, channels),
+  include_top = FALSE
+)
+
+# Zamrożenie warstw
+for (layer in pre_trained_model$layers) {
+  layer$trainable <- FALSE
+}
+
+# Odmrożenie warstw do tuningu
+set_trainable <- FALSE
+for (layer in pre_trained_model$layers) {
+  if (layer$name == 'conv5_block1_out') {  # Change based on desired layer
+    set_trainable <- TRUE
+  }
+  layer$trainable <- set_trainable
+}
+
+# Model
+model3 <- keras_model_sequential() %>%
+  pre_trained_model %>%
+  layer_global_average_pooling_2d() %>%
+  layer_dense(units = 1024, activation = 'relu') %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_dense(units = 4, activation = 'softmax')
+
+# Kompilacja modelu
+model3 %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.0001),
+  loss = 'categorical_crossentropy',
+  metrics = 'accuracy'
+)
+
+Model3Metrics_Train <- train_and_evaluate(model3, train_ds, val_ds, 20, "history3")
+```
+
+```{r}
+plot(history3)
+```
+
+1.  **Dokładność**:
+
+    -   **Linia treningowa (czerwona)**: Szybko osiąga wysoką dokładność, stabilizując się blisko 1.0, co wskazuje na efektywne uczenie modelu.
+
+    -   **Linia walidacyjna (turkusowa)**: Dokładność rośnie stabilnie, również osiągając wysoki poziom, co sugeruje dobrą generalizację na dane walidacyjne.
+
+2.  **Strata**:
+
+    -   **Linia treningowa (czerwona)**: Strata gwałtownie spada i stabilizuje się na niskim poziomie, co świadczy o skutecznym dopasowaniu modelu.
+
+    -   **Linia walidacyjna (turkusowa)**: Strata walidacyjna również szybko maleje i utrzymuje się na niskim poziomie, co wskazuje na dobrą wydajność modelu na danych walidacyjnych.
+
+#### Porównanie z poprzednimi wykresami
+
+-   `Model 1` i `Model 2`: Model ResNet50 osiąga wysoką dokładność i niską stratę szybciej niż wcześniejsze modele. Transfer learning umożliwia efektywne wykorzystanie wstępnie wyuczonych cech, co przekłada się na lepsze wyniki w krótszym czasie.
+
+Ogólnie, model ResNet50 prezentuje doskonałą wydajność z szybszym osiągnięciem wysokiej dokładności i niskiej straty w porównaniu do poprzednich modeli, co czyni go bardzo efektywnym w klasyfikacji obrazów.
+
+#### Wizualizacja predykcji
+
+```{r results='hide'}
+ev_r <- evaluate_predictions(model1, train_ds)
+```
+
+```{r}
+visualize_predictions(ev_r, classes)
+```
+
+#### Ewaluacja na zbiorze testowym
+
+```{r warning=FALSE, message=FALSE, results='hide'}
+conf_m <- calculate_confusion_matrix(model3, test_ds)
+Model3Metrics_Test <- evaluate_model(model3, test_ds)
+```
+
+ 
+
+```{r message=TRUE, echo=TRUE}
+print(conf_m$table)
+```
+
+-   **Dokładność**: Bardzo wysoka, z minimalnymi błędami w klasach 0 i 3 (po jednym błędzie w każdej).
+
+-   **Błędy**: Nieliczne pomyłki, co może wskazywać na świetne, choć nieco mniej idealne dopasowanie w porównaniu do Modelu 2.
+
+### DenseNet121
+
+![](images/DENSE.png)
+
+DenseNet121 to zaawansowana architektura sieci neuronowej charakteryzująca się gęstymi połączeniami między warstwami, gdzie każda warstwa otrzymuje dane wejściowe ze wszystkich poprzednich warstw. Składa się z kilku kluczowych elementów:
+
+1.  **Bloki gęste (D1-D4)**: Każdy blok gęsty zawiera wiele warstw konwolucyjnych, co umożliwia efektywne wydobywanie cech z obrazów przy jednoczesnym minimalizowaniu zjawiska zanikania gradientów.
+
+2.  **Warstwy przejściowe (T1-T3)**: Warstwy te redukują wymiarowość danych, co zmniejsza złożoność obliczeniową i ułatwia przepływ informacji w sieci.
+
+3.  **Warstwa końcowa**: Po ostatnim bloku gęstym następuje globalne uśrednianie, a następnie w pełni połączona warstwa, która prowadzi do klasyfikacji końcowej.
+
+```{r warning=FALSE, message=FALSE, results='hide'}
+# DenseNet121
+pre_trained_model <- application_densenet121(
+  weights = 'imagenet',
+  input_shape = c(image_size, channels),
+  include_top = FALSE
+)
+
+# Zamrożenie warstw
+for (layer in pre_trained_model$layers) {
+  layer$trainable <- FALSE
+}
+
+# Odmrożenie warstw do tuningu
+set_trainable <- FALSE
+for (layer in pre_trained_model$layers) {
+  if (layer$name == 'conv5_block16_concat') { 
+    set_trainable <- TRUE
+  }
+  layer$trainable <- set_trainable
+}
+
+# Model
+model4 <- keras_model_sequential() %>%
+  pre_trained_model %>%
+  layer_global_average_pooling_2d() %>%
+  layer_dense(units = 1024, activation = 'relu') %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_dense(units = 4, activation = 'softmax')
+
+# Kompilacja modelu
+model4 %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.0001),
+  loss = 'categorical_crossentropy',
+  metrics = 'accuracy'
+)
+
+
+Model4Metrics_Train <- train_and_evaluate(model4, test_ds, val_ds, 20, "history4")
+```
+
+-   **Wczytanie modelu DenseNet121**: Model jest ładowany z wstępnie wyuczonymi wagami z `ImageNet`, bez górnych warstw, co pozwala na jego adaptację do nowych danych.
+
+-   **Zamrożenie warstw**: Wszystkie warstwy modelu są początkowo zablokowane, co zapobiega zmianom w wyuczonych wcześniej cechach podczas dalszego trenowania.
+
+-   **Odmrożenie warstw do tuningu**: Warstwy są odblokowywane od wybranej warstwy (`conv5_block16_concat`), co umożliwia fine-tuning, dostosowując model do specyficznych danych treningowych.
+
+-   **Budowa modelu `model4`**: Do modelu dodano warstwę globalnego uśredniania, warstwę gęstą z 1024 jednostkami i warstwę dropout, zakończoną warstwą wyjściową z 4 jednostkami, dostosowaną do klasyfikacji.
+
+-   **Kompilacja modelu**: Model jest kompilowany z optymalizatorem `Adam`, funkcją straty `categorical_crossentropy` oraz metryką dokładności, co jest standardowym podejściem w zadaniach klasyfikacji wieloklasowej.
+
+```{r}
+plot(history4)
+```
+
+-   **Dokładność**:
+
+    -   **Linia treningowa (czerwona)**: Wolny wzrost, stabilizujący się na niższym poziomie, co sugeruje trudności w pełnym dopasowaniu do danych treningowych.
+
+    -   **Linia walidacyjna (turkusowa)**: Stały wzrost, osiągający wyższe wartości niż dokładność treningowa, co wskazuje na lepsze dopasowanie do danych walidacyjnych.
+
+-   **Strata**:
+
+    -   **Linia treningowa (czerwona)**: Stopniowy spadek, ale stabilizujący się na wyższym poziomie.
+
+    -   **Linia walidacyjna (turkusowa)**: Strata spada wyraźnie, wskazując na skuteczne uczenie modelu na danych walidacyjnych.
+
+        #### Porównanie z poprzednimi modelami
+
+        -   **Poprzednie modele** (ResNet50 i inne): Osiągały wyższą dokładność i niższą stratę szybciej, co sugeruje lepsze dopasowanie i efektywność w uczeniu.
+
+        -   **DenseNet121**: Choć dokładność walidacyjna wzrasta, model potrzebuje więcej czasu na naukę i pokazuje mniejsze dopasowanie do danych treningowych, co może wskazywać na potencjalne niedopasowanie lub potrzebę dalszego tuningu.
+
+#### Wizualizacja predykcji
+
+```{r results='hide'}
+ev_r <- evaluate_predictions(model1, train_ds)
+```
+
+```{r}
+visualize_predictions(ev_r, classes)
+```
+
+#### Ewaluacja na zbiorze testowym
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+Model4Metrics_Test <- evaluate_model(model4, test_ds)
+conf_m <- calculate_confusion_matrix(model4, test_ds)
+```
+
+```{r message=TRUE, echo=TRUE}
+print(conf_m$table)
+```
+
+1.  **Dokładność**:
+
+    -   Model ma trudności z rozróżnianiem klas 0 i 3, co prowadzi do znaczącej liczby błędów w tych kategoriach.
+
+    -   Klas 1 i 2 są klasyfikowane poprawnie z wysoką dokładnością, co wskazuje na lepsze dopasowanie w tych przypadkach.
+
+2.  **Błędy**:
+
+    -   Wysoka liczba błędów pomiędzy klasami 0 i 3, co sugeruje, że te klasy mogą być do siebie zbliżone wizualnie lub cechy używane do klasyfikacji nie są wystarczająco różnicujące.
+
+#### Porównanie z poprzednimi modelami
+
+-   **Porównanie z innymi modelami**: Wcześniejsze modele miały mniejszą liczbę błędów i lepszą dokładność we wszystkich klasach. DenseNet121 wykazuje większe trudności w klasyfikacji, co może wskazywać na potrzebę dodatkowej optymalizacji lub zmian w danych treningowych.
+
+### InceptionV3
+
+![](images/InceptionV3-Architecture.png)
+
+InceptionV3 to zaawansowana architektura sieci neuronowej, zaprojektowana do zadań klasyfikacji obrazów. Model ten charakteryzuje się zastosowaniem modułów Inception, które równolegle przetwarzają dane przez różne filtry konwolucyjne.
+
+1.  **Różnorodność filtrów**: Moduły Inception łączą wyniki z filtrów o różnych rozmiarach, co pozwala na skuteczne uchwycenie zróżnicowanych cech obrazu.
+
+2.  **Warstwy pooling**: Zarówno średnie, jak i maksymalne pooling są stosowane w celu zmniejszenia wymiarowości i zapobiegania przeuczeniu.
+
+3.  **Warstwa końcowa**: Po warstwach konwolucyjnych i pooling, model zawiera w pełni połączoną warstwę z funkcją softmax, która generuje ostateczne klasyfikacje.
+
+```{r echo=FALSE, warning=FALSE, message=FALSE, results='hide'}
+
+# Ładowanie InceptionV3 
+pre_trained_model <- application_inception_v3(
+  weights = 'imagenet',
+  input_shape = c(image_size, channels),
+  include_top = FALSE
+)
+
+# Zamrożenie warstw
+for (layer in pre_trained_model$layers) {
+  layer$trainable <- FALSE
+}
+
+# Odmrożenie warstw do tuningu
+set_trainable <- FALSE
+for (layer in pre_trained_model$layers) {
+  if (layer$name == 'mixed7') {
+    set_trainable <- TRUE
+  }
+  layer$trainable <- set_trainable
+}
+
+# Model
+model5 <- keras_model_sequential() %>%
+  pre_trained_model %>%
+  layer_global_average_pooling_2d() %>%
+  layer_dense(units = 1024, activation = 'relu') %>%
+  layer_dropout(rate = 0.5) %>%
+  layer_dense(units = 4, activation = 'softmax')
+
+# kompilacja modelu
+model5 %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.0001),
+  loss = 'categorical_crossentropy',
+  metrics = 'accuracy'
+)
+
+Model5Metrics_Train <- train_and_evaluate(model5, train_ds, val_ds, 20, "history5")
+```
+
+-   **Ładowanie modelu InceptionV3**: Model jest wczytywany z wstępnie wyuczonymi wagami `ImageNet`, bez ostatnich warstw, co umożliwia dostosowanie go do nowych danych.
+
+-   **Zamrożenie warstw**: Wszystkie warstwy są początkowo zablokowane, co zapobiega zmianom w wyuczonych wcześniej cechach.
+
+-   **Odmrożenie warstw do tuningu**: Warstwy są odblokowywane od warstwy `mixed7`, co pozwala na fine-tuning i dopasowanie modelu do specyficznych danych.
+
+-   **Budowa modelu `model5`**: Dodano warstwę globalnego uśredniania, gęstą warstwę z 1024 jednostkami i warstwę dropout, zakończoną warstwą wyjściową z 4 jednostkami, przeznaczoną do klasyfikacji.
+
+-   **Kompilacja modelu**: Model jest kompilowany z użyciem optymalizatora `Adam`, funkcji straty `categorical_crossentropy` i metryki `accuracy`, co jest standardem w klasyfikacji wieloklasowej.
+
+```{r}
+plot(history5)
+```
+
+1.  **Dokładność**:
+
+    -   **Linia treningowa (czerwona)**: Szybko osiąga wysoką dokładność, stabilizując się blisko 1.0.
+
+    -   **Linia walidacyjna (turkusowa)**: Stały wzrost, osiągający umiarkowane wartości, co wskazuje na poprawne dopasowanie do danych walidacyjnych, ale nie na poziomie treningowym.
+
+2.  **Strata**:
+
+-   **Linia treningowa (czerwona)**: Szybki spadek straty, stabilizujący się na bardzo niskim poziomie.
+
+-   **Linia walidacyjna (turkusowa)**: Znaczący spadek, ale utrzymujący się na wyższym poziomie niż strata treningowa.
+
+#### Wizualizacja predykcji
+
+```{r results='hide'}
+ev_r <- evaluate_predictions(model1, train_ds)
+```
+
+```{r}
+visualize_predictions(ev_r, classes)
+```
+
+#### Porównanie z poprzednimi modelami
+
+-   **ResNet50**: Oba modele pokazują wysoką dokładność treningową, ale InceptionV3 ma trudności w osiągnięciu równie wysokiej dokładności walidacyjnej, co może wskazywać na różnice w generalizacji.
+
+-   **DenseNet121**: InceptionV3 osiąga wyższą dokładność i niższą stratę treningową szybciej niż DenseNet121, co sugeruje lepsze dopasowanie.
+
+-   **Pozostałe modele**: InceptionV3 generalnie dobrze radzi sobie z dopasowaniem, ale może wymagać dalszej optymalizacji w celu poprawy wyników walidacyjnych.
+
+#### Ewaluacja na zbiorze testowym
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+Model5Metrics_Test <- evaluate_model(model5, test_ds)
+conf_m <- calculate_confusion_matrix(model5, test_ds)
+```
+
+```{r  message=TRUE, echo=TRUE}
+print(conf_m$table)
+```
+
+1.  **Dokładność**:
+
+    -   Model osiąga wysoką dokładność w większości klas, z drobnymi błędami w przewidywaniu, szczególnie w klasach 0 i 3.
+
+    -   Klasy 1 i 2 są klasyfikowane poprawnie z bardzo wysoką dokładnością.
+
+2.  **Błędy**:
+
+    -   Niewielkie liczby błędnych klasyfikacji występują w klasach 0 i 3, co może sugerować pewne trudności w rozróżnianiu cech tych klas.
+
+#### Porównanie z poprzednimi modelami
+
+-   **ResNet50 i DenseNet121**: InceptionV3 wykazuje ogólnie wysoką dokładność, ale w porównaniu do ResNet50, może mieć nieco więcej błędów w określonych klasach.
+
+-   **Ogólna wydajność**: W porównaniu do wcześniejszych modeli, InceptionV3 pokazuje solidną wydajność z niewielką liczbą błędów, co sugeruje skuteczność w klasyfikacji, choć nie jest całkowicie wolny od błędów.
+
+## Wniosek
+
+Porównanie różnych modeli w kontekście uczenia maszynowego ujawnia zróżnicowane podejścia i skuteczność każdego z nich. Analizując dokładność, szybkość uczenia oraz zdolność do generalizacji, możemy zidentyfikować mocne i słabe strony poszczególnych architektur. Każdy model ma unikalne właściwości, które wpływają na jego wydajność w zadaniach klasyfikacyjnych, co prowadzi do zróżnicowanych wyników w praktycznych zastosowaniach. Wnikliwa analiza tych aspektów pozwala na wyciągnięcie konstruktywnych wniosków dotyczących ich efektywności i przydatności w różnych scenariuszach.
+
+### Porównanie wszystkich modeli(Uczenie)
+
+W tej sekcji dokonujemy analizy porównawczej różnych modeli pod względem ich dokładności, straty oraz czasu trenowania. Wykres przedstawia:
+
+```{r}
+#Kombinowanie metryk wszystkich modele w df
+results_df_train <- data.frame(
+  Model = c("Model 1", "Model 2", "ResNet50", "DenseNet121", "InceptionV3"),
+  accuracy = c(Model1Metrics_Train$accuracy, 
+               Model2Metrics_Train$accuracy, 
+               Model3Metrics_Train$accuracy, 
+               Model4Metrics_Train$accuracy, 
+               Model5Metrics_Train$accuracy),
+  loss = c(Model1Metrics_Train$loss, 
+           Model2Metrics_Train$loss, 
+           Model3Metrics_Train$loss, 
+           Model4Metrics_Train$loss, 
+           Model5Metrics_Train$loss),
+  training_time = c(Model1Metrics_Train$training_time, 
+                    Model2Metrics_Train$training_time, 
+                    Model3Metrics_Train$training_time, 
+                    Model4Metrics_Train$training_time, 
+                    Model5Metrics_Train$training_time)
+)
+
+
+kable(results_df_train)
+
+# Wizualizacja wyników
+results_df_train_long <- results_df_train %>%
+  pivot_longer(cols = c("accuracy", "loss", "training_time"), names_to = "Metric", values_to = "Value")
+
+ggplot(results_df_train_long, aes(x = Model, y = Value, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~Metric, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Porównanie modeli podczas nauczania", y = "Value", x = "Model") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+-   **Dokładność (accuracy)**:
+
+    -   Modele 1, 2 i ResNet50 osiągają najwyższą dokładność, co wskazuje na ich skuteczność w klasyfikacji.
+
+    -   DenseNet121 i InceptionV3 prezentują niższą dokładność, co może sugerować konieczność dalszej optymalizacji.
+
+-   **Strata (loss)**:
+
+    -   Modele 1 i 2 wykazują niską stratę, co potwierdza dobre dopasowanie do danych treningowych.
+
+    -   DenseNet121 ma najwyższą stratę, co wskazuje na problemy z dopasowaniem.
+
+-   **Czas trenowania (training_time)**:
+
+    -   DenseNet121 i InceptionV3 mają krótszy czas trenowania w porównaniu do ResNet50, co może być korzystne w kontekście efektywności.
+
+    -   Model 1 i Model 2 również wymagają krótszego czasu, ale zachowują wysoką dokładność.
+
+### Porównanie wszystkich modeli(Testowy)
+
+W tej sekcji analizujemy wydajność modeli na zbiorze testowym, skupiając się na dokładności, stracie oraz czasie przetwarzania. Wykres przedstawia:
+
+```{r}
+#Kombinowanie metryk wszystkich modele w df
+results_df_test <- data.frame(
+  Model = c("Model 1", "Model 2", "ResNet50", "DenseNet121", "InceptionV3"),
+  accuracy = c(Model1Metrics_Test$accuracy, 
+               Model2Metrics_Test$accuracy, 
+               Model3Metrics_Test$accuracy, 
+               Model4Metrics_Test$accuracy, 
+               Model5Metrics_Test$accuracy
+               ),
+  loss = c(Model1Metrics_Test$loss, 
+           Model2Metrics_Test$loss, 
+           Model3Metrics_Test$loss, 
+           Model4Metrics_Test$loss, 
+           Model5Metrics_Test$loss
+           ),
+  time_taken = c(
+    Model1Metrics_Test$time_taken, 
+    Model2Metrics_Test$time_taken, 
+    Model3Metrics_Test$time_taken, 
+    Model4Metrics_Test$time_taken, 
+    Model5Metrics_Test$time_taken
+    )
+)
+
+
+kable(results_df_test)
+
+# Wizualizacja wyników
+results_df_test_long <- results_df_test %>%
+  pivot_longer(cols = c("accuracy", "loss", "time_taken"), names_to = "Metric", values_to = "Value")
+
+ggplot(results_df_test_long, aes(x = Model, y = Value, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~Metric, scales = "free_y") +
+  theme_minimal() +
+  labs(title = "Porównanie modeli na zbiorze testowym", y = "Value", x = "Model") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+-   **Dokładność (accuracy)**:
+
+    -   Modele 1, 2 i ResNet50 osiągają najwyższą dokładność, co potwierdza ich skuteczność na danych testowych.
+
+    -   DenseNet121 i InceptionV3 mają niższą dokładność, co wskazuje na potrzebę dalszej optymalizacji lub lepszego dostosowania do danych.
+
+-   **Strata (loss)**:
+
+    -   Model 2 wykazuje najniższą stratę, co sugeruje bardzo dobre dopasowanie do danych testowych.
+
+    -   DenseNet121 ma najwyższą stratę, co może oznaczać problemy z dopasowaniem i generalizacją.
+
+    -   **Czas przetwarzania (time_taken)**:
+
+    -   DenseNet121 wymaga najwięcej czasu na przetwarzanie, co może wpływać na jego efektywność w kontekście operacyjnym.
+
+    -   Modele 1, 2 i ResNet50 przetwarzają dane szybciej, zachowując wysoką dokładność.
+
+### Ogólny wniosek do projektu
+
+W projekcie zbadano różne architektury modeli uczenia maszynowego pod kątem ich skuteczności w klasyfikacji danych. Modele 1, 2 i ResNet50 wykazały się najwyższą dokładnością i najniższą stratą zarówno na zbiorze treningowym, jak i testowym, co potwierdza ich zdolność do efektywnej generalizacji. Z kolei DenseNet121 i InceptionV3 wymagają dalszej optymalizacji, aby osiągnąć lepsze wyniki.
+
+Analiza wydajności modeli, w tym ich czasu przetwarzania, pozwala na świadome podejmowanie decyzji o wyborze modelu w zależności od potrzeb aplikacyjnych. Wybór odpowiedniego modelu zależy od kompromisu między dokładnością, czasem przetwarzania i zasobami obliczeniowymi. Ogólnie, projekt dostarcza wartościowych wniosków dotyczących zastosowania transfer learningu i dostosowywania architektur do specyficznych zadań klasyfikacyjnych.
